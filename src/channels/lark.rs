@@ -632,7 +632,7 @@ impl LarkChannel {
 
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
-                        sender: lark_msg.chat_id.clone(),
+                        sender: sender_open_id.to_string(),
                         reply_target: lark_msg.chat_id.clone(),
                         content: text,
                         channel: "lark".to_string(),
@@ -643,7 +643,7 @@ impl LarkChannel {
                         thread_ts: None,
                     };
 
-                    tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
+                    tracing::debug!("Lark WS: message from {} in {}", sender_open_id, lark_msg.chat_id);
                     if tx.send(channel_msg).await.is_err() { break; }
                 }
             }
@@ -831,7 +831,7 @@ impl LarkChannel {
 
         messages.push(ChannelMessage {
             id: Uuid::new_v4().to_string(),
-            sender: chat_id.to_string(),
+            sender: open_id.to_string(),
             reply_target: chat_id.to_string(),
             content: text,
             channel: "lark".to_string(),
