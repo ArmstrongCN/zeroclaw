@@ -7,14 +7,21 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod api;
+pub mod sse;
+pub mod static_files;
+pub mod ws;
+
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
+use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
 use crate::tools;
+use crate::tools::traits::ToolSpec;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
@@ -22,7 +29,7 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use parking_lot::Mutex;
@@ -290,6 +297,12 @@ pub struct AppState {
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
+    /// Registered tool specs (for web dashboard tools page)
+    pub tools_registry: Arc<Vec<ToolSpec>>,
+    /// Cost tracker (optional, for web dashboard cost page)
+    pub cost_tracker: Option<Arc<CostTracker>>,
+    /// SSE broadcast channel for real-time events
+    pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -357,7 +370,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let tools_registry_raw = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -370,7 +383,25 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    ));
+    );
+    let tools_registry: Arc<Vec<ToolSpec>> =
+        Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
+
+    // Cost tracker (optional)
+    let cost_tracker = if config.cost.enabled {
+        match CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+            Ok(ct) => Some(Arc::new(ct)),
+            Err(e) => {
+                tracing::warn!("Failed to initialize cost tracker: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // SSE broadcast channel for real-time events
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -522,6 +553,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
+    println!("  🌐 Web Dashboard: http://{display_addr}/");
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
     if whatsapp_channel.is_some() {
@@ -534,6 +566,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if nextcloud_talk_channel.is_some() {
         println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
     }
+    println!("  GET  /api/*     — REST API (bearer token required)");
+    println!("  GET  /ws/chat   — WebSocket agent chat");
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
@@ -557,9 +591,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         hooks.fire_gateway_start(host, actual_port).await;
     }
 
-    // Build shared state
-    let observer: Arc<dyn crate::observability::Observer> =
-        Arc::from(crate::observability::create_observer(&config.observability));
+    // Wrap observer with broadcast capability for SSE
+    let broadcast_observer: Arc<dyn crate::observability::Observer> =
+        Arc::new(sse::BroadcastObserver::new(
+            crate::observability::create_observer(&config.observability),
+            event_tx.clone(),
+        ));
 
     let state = AppState {
         config: config_state,
@@ -579,11 +616,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         linq_signing_secret,
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
-        observer,
+        observer: broadcast_observer,
+        tools_registry,
+        cost_tracker,
+        event_tx,
     };
+
+    // Config PUT needs larger body limit (1MB)
+    let config_put_router = Router::new()
+        .route("/api/config", put(api::handle_api_config_put))
+        .layer(RequestBodyLimitLayer::new(1_048_576));
 
     // Build router with middleware
     let app = Router::new()
+        // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
@@ -592,12 +638,37 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
+        // ── Web Dashboard API routes ──
+        .route("/api/status", get(api::handle_api_status))
+        .route("/api/config", get(api::handle_api_config_get))
+        .route("/api/tools", get(api::handle_api_tools))
+        .route("/api/cron", get(api::handle_api_cron_list))
+        .route("/api/cron", post(api::handle_api_cron_add))
+        .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
+        .route("/api/integrations", get(api::handle_api_integrations))
+        .route("/api/doctor", post(api::handle_api_doctor))
+        .route("/api/memory", get(api::handle_api_memory_list))
+        .route("/api/memory", post(api::handle_api_memory_store))
+        .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
+        .route("/api/cost", get(api::handle_api_cost))
+        .route("/api/cli-tools", get(api::handle_api_cli_tools))
+        .route("/api/health", get(api::handle_api_health))
+        // ── SSE event stream ──
+        .route("/api/events", get(sse::handle_sse_events))
+        // ── WebSocket agent chat ──
+        .route("/ws/chat", get(ws::handle_ws_chat))
+        // ── Static assets (web dashboard) ──
+        .route("/_app/{*path}", get(static_files::handle_static))
+        // ── Config PUT with larger body limit ──
+        .merge(config_put_router)
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
-        ));
+        ))
+        // ── SPA fallback: non-API GET requests serve index.html ──
+        .fallback(get(static_files::handle_spa_fallback));
 
     // Run the server
     axum::serve(
@@ -726,11 +797,7 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
 }
 
 /// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
-async fn run_gateway_chat_simple(
-    state: &AppState,
-    provider_label: &str,
-    message: &str,
-) -> anyhow::Result<String> {
+async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Result<String> {
     let user_messages = vec![ChatMessage::user(message)];
 
     // Keep webhook/gateway prompts aligned with channel behavior by injecting
@@ -888,7 +955,7 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_simple(&state, &provider_label, message).await {
+    match run_gateway_chat_simple(&state, message).await {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
@@ -1289,13 +1356,6 @@ async fn handle_nextcloud_talk_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    let provider_label = state
-        .config
-        .lock()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
-
     for msg in &messages {
         tracing::info!(
             "Nextcloud Talk message from {}: {}",
@@ -1413,6 +1473,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1458,6 +1521,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer,
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1820,6 +1886,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let mut headers = HeaderMap::new();
@@ -1880,6 +1949,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let headers = HeaderMap::new();
@@ -1952,6 +2024,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let response = handle_webhook(
@@ -1996,6 +2071,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let mut headers = HeaderMap::new();
@@ -2045,6 +2123,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let mut headers = HeaderMap::new();
@@ -2099,6 +2180,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2149,6 +2233,9 @@ mod tests {
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
         };
 
         let mut headers = HeaderMap::new();
